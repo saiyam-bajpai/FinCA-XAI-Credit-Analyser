@@ -7,6 +7,20 @@ from backend.api import applications, auth, officer
 from backend.core.security import get_password_hash
 from backend.db.database import Base, SessionLocal, engine
 from backend.db.models import User
+from backend.api import officer
+
+# backend/main.py
+from pathlib import Path
+import joblib
+
+# Points to backend/artifacts
+ARTIFACTS_DIR = Path(__file__).resolve().parent / "artifacts"
+
+# Load saved artifacts when backend starts
+model = joblib.load(ARTIFACTS_DIR / "finca_calibrated_model.joblib")
+base_xgb = joblib.load(ARTIFACTS_DIR / "finca_base_xgb.joblib")
+shap_explainer = joblib.load(ARTIFACTS_DIR / "finca_shap_explainer.joblib")
+feature_names = joblib.load(ARTIFACTS_DIR / "feature_names.joblib")
 
 
 def seed_demo_users():
@@ -75,7 +89,7 @@ app.add_middleware(
 # Register API Routers
 app.include_router(auth.router)
 app.include_router(applications.router)
-app.include_router(officer.router)
+app.include_router(officer.router, prefix="/api/officer", tags=["Officer"])
 
 
 @app.get("/")
