@@ -1,22 +1,22 @@
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
+import datetime
+from typing import List, Optional
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
-from backend.core.finance_math import calculate_emi, calculate_foir_max_loan_limit
-from backend.core.security import get_current_user
+from backend.core.security import get_current_user, get_user_from_token_or_query
+from backend.core.underwriting import create_application_for_user, get_xai_engine
+from backend.core.uploads import delete_stored_file, resolve_stored_path, save_upload
 from backend.db.database import get_db
 from backend.db.models import AuditLog, DocumentRequest, LoanApplication, User
-from backend.ml.explainability import XAIEngine
-from backend.schemas.application import LoanApplicationCreate, LoanApplicationResponse
+from backend.schemas.application import (
+    DocumentRequestResponse,
+    DocumentRequestStatusUpdate,
+    LoanApplicationCreate,
+    LoanApplicationResponse,
+)
 
 router = APIRouter(prefix="/api/applications", tags=["Applications"])
-
-# Global XAI Engine Instance
-try:
-    xai_engine = XAIEngine()
-except Exception as e:
-    print(f"Warning: XAIEngine initialization delayed until model artifact generation ({e})")
-    xai_engine = None
 
 
 @router.post("/apply", response_model=LoanApplicationResponse, status_code=status.HTTP_201_CREATED)
@@ -25,118 +25,17 @@ def apply_for_loan(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    global xai_engine
-    if xai_engine is None:
-        try:
-            xai_engine = XAIEngine()
-        except Exception as err:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"AI scoring engine artifact unavailable: {err}"
-            )
+    try:
+        # Ensures the XAI artifacts are available before we touch the database,
+        # so a scoring failure never leaves a half-written application behind.
+        get_xai_engine()
+    except Exception as err:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"AI scoring engine artifact unavailable: {err}"
+        )
 
-    # 1. Financial Math Calculations
-    foir_data = calculate_foir_max_loan_limit(
-        annual_income=app_in.income,
-        existing_emis=app_in.existing_emis,
-        tenure_months=app_in.tenure
-    )
-    calculated_emi = calculate_emi(
-        principal=app_in.loan_amount,
-        tenure_months=app_in.tenure
-    )
-
-    # 2. Prepare dict for ML / XAI Engine
-    applicant_dict = {
-        "income": app_in.income,
-        "debt": app_in.debt,
-        "credit_score": app_in.credit_score,
-        "loan_amount": app_in.loan_amount,
-        "loan_term": app_in.tenure,
-        "employment_length": app_in.employment_length,
-        "existing_emis": app_in.existing_emis,
-        "dependents": app_in.dependents
-    }
-
-    # 3. Execute Explainable AI scoring
-    xai_output = xai_engine.explain_instance(applicant_dict)
-
-    decision_info = xai_output["decision"]
-    prob = decision_info["approval_probability"]
-    ai_score = decision_info["finCA_credit_score"]
-
-    # 4. Risk Tier Classification
-    if prob >= 0.70:
-        risk_tier = "Low"
-        initial_status = "UNDER_REVIEW"
-    elif prob >= 0.45:
-        risk_tier = "Medium"
-        initial_status = "DOCS_REQUIRED"
-    else:
-        risk_tier = "High"
-        initial_status = "REJECTED"
-
-    # Rejection & Recourse formatting
-    rejection_reason = None
-    time_to_fix_months = None
-
-    if initial_status == "REJECTED":
-        top_neg = xai_output.get("top_negative_factors", [])
-        if top_neg:
-            neg_descriptions = [f"{factor['feature']} (impact: {factor['shap_impact']})" for factor in top_neg]
-            rejection_reason = "Automated credit risk threshold exceeded based on: " + ", ".join(neg_descriptions)
-        else:
-            rejection_reason = "High debt-to-income and credit risk indicators."
-
-        cfs = xai_output.get("counterfactual_recommendations", [])
-        if cfs and len(cfs) > 0:
-            time_to_fix_months = cfs[0].get("estimated_time_to_fix", "3-6 Months")
-
-    # 5. Create DB Record
-    new_application = LoanApplication(
-        applicant_id=current_user.id,
-        income=app_in.income,
-        credit_score=app_in.credit_score,
-        debt=app_in.debt,
-        loan_amount=app_in.loan_amount,
-        tenure=app_in.tenure,
-        employment_length=app_in.employment_length,
-        existing_emis=app_in.existing_emis,
-        dependents=app_in.dependents,
-        max_eligible_loan=foir_data["max_eligible_loan_amount"],
-        calculated_emi=calculated_emi,
-        foir_ratio=foir_data["foir_ratio"],
-        status=initial_status,
-        ai_score=ai_score,
-        approval_probability=prob,
-        risk_tier=risk_tier,
-        rejection_reason=rejection_reason,
-        time_to_fix_months=time_to_fix_months,
-        xai_breakdown_json=xai_output
-    )
-
-    db.add(new_application)
-    db.flush()
-
-    # 6. Automatic Document Requests if required
-    if initial_status == "DOCS_REQUIRED" or risk_tier == "Medium":
-        doc1 = DocumentRequest(application_id=new_application.id, doc_name="Bank Statement (6 Months)", status="PENDING")
-        doc2 = DocumentRequest(application_id=new_application.id, doc_name="Tax Return (Recent Year)", status="PENDING")
-        db.add_all([doc1, doc2])
-
-    # 7. Audit Log
-    audit = AuditLog(
-        application_id=new_application.id,
-        officer_id=None,
-        action="SUBMITTED",
-        notes=f"Application submitted. AI Score: {ai_score}, Risk Tier: {risk_tier}, Status: {initial_status}"
-    )
-    db.add(audit)
-
-    db.commit()
-    db.refresh(new_application)
-
-    return new_application
+    return create_application_for_user(db, current_user, app_in)
 
 
 @router.get("/my-applications", response_model=List[LoanApplicationResponse])
@@ -151,3 +50,154 @@ def get_my_applications(
         .all()
     )
     return applications
+
+
+@router.post("/documents/{document_id}/upload", response_model=DocumentRequestResponse)
+def upload_applicant_document(
+    document_id: int,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Applicant uploads a real document file (PDF or Image, max 10 MB)."""
+    document = (
+        db.query(DocumentRequest)
+        .join(LoanApplication, DocumentRequest.application_id == LoanApplication.id)
+        .filter(
+            DocumentRequest.id == document_id,
+            LoanApplication.applicant_id == current_user.id,
+        )
+        .first()
+    )
+
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document request with ID {document_id} not found."
+        )
+
+    # Persist and validate file type (PDF/Images) and size (10 MB limit)
+    stored = save_upload(file)
+
+    # Remove previously stored file if applicant is re-uploading
+    if document.stored_path:
+        delete_stored_file(document.stored_path)
+
+    document.file_name = stored.file_name
+    document.stored_path = stored.stored_path
+    document.mime_type = stored.mime_type
+    document.file_size = stored.file_size
+    document.uploaded_at = datetime.datetime.utcnow()
+    document.uploaded_by = current_user.id
+    document.status = "UPLOADED"
+
+    db.add(
+        AuditLog(
+            application_id=document.application_id,
+            officer_id=None,
+            action="DOCUMENT_UPLOADED",
+            notes=f"Applicant uploaded file '{stored.file_name}' ({stored.mime_type}, {round(stored.file_size / 1024, 1)} KB) for '{document.doc_name}'.",
+        )
+    )
+
+    db.commit()
+    db.refresh(document)
+    return document
+
+
+@router.get("/documents/{document_id}/file")
+def get_applicant_document_file(
+    document_id: int,
+    download: bool = Query(False, description="Set to true to force download instead of inline view"),
+    current_user: User = Depends(get_user_from_token_or_query),
+    db: Session = Depends(get_db)
+):
+    """View or download the uploaded document file. Only accessible to applicant owner or loan officers."""
+    document = (
+        db.query(DocumentRequest)
+        .join(LoanApplication, DocumentRequest.application_id == LoanApplication.id)
+        .filter(DocumentRequest.id == document_id)
+        .first()
+    )
+
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document request with ID {document_id} not found."
+        )
+
+    # Check permission: applicant must own the application, or user must be a LOAN_OFFICER
+    is_owner = document.application.applicant_id == current_user.id
+    is_officer = current_user.role == "LOAN_OFFICER"
+    if not (is_owner or is_officer):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You are not authorized to view this document."
+        )
+
+    if not document.stored_path:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No file has been uploaded for this document request."
+        )
+
+    file_path = resolve_stored_path(document.stored_path)
+    if not file_path or not file_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Stored document file could not be found on server."
+        )
+
+    disposition = "attachment" if download else "inline"
+    return FileResponse(
+        path=str(file_path),
+        filename=document.file_name or "document",
+        media_type=document.mime_type or "application/octet-stream",
+        content_disposition_type=disposition
+    )
+
+
+@router.patch("/documents/{document_id}", response_model=DocumentRequestResponse)
+def upload_requested_document(
+    document_id: int,
+    update_in: DocumentRequestStatusUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Applicant marks a requested document as uploaded (metadata update fallback)."""
+    document = (
+        db.query(DocumentRequest)
+        .join(LoanApplication, DocumentRequest.application_id == LoanApplication.id)
+        .filter(
+            DocumentRequest.id == document_id,
+            LoanApplication.applicant_id == current_user.id,
+        )
+        .first()
+    )
+
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document request with ID {document_id} not found."
+        )
+
+    if update_in.status.upper() != "UPLOADED":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Applicants may only mark a document as UPLOADED."
+        )
+
+    document.status = "UPLOADED"
+
+    db.add(
+        AuditLog(
+            application_id=document.application_id,
+            officer_id=None,
+            action="DOCUMENT_UPLOADED",
+            notes=f"Applicant marked document as uploaded: {document.doc_name}",
+        )
+    )
+
+    db.commit()
+    db.refresh(document)
+    return document
